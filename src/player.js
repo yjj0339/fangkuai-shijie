@@ -1,0 +1,334 @@
+// ===== 玩家：输入、移动、生存数值、背包、手持渲染 =====
+import * as THREE from 'three';
+import { stepEntity, onGroundCheck, hasSupport, checkWater } from './physics.js';
+import { B, blockInfo } from './blocks.js';
+import { tileUVh, tileUVv } from './textures.js';
+
+const WALK = 4.32, SPRINT = 5.61, SNEAK = 1.31, FLY = 10.9, FLY_SPRINT = 21;
+const JUMP_V = 8.7;
+
+export class Player {
+  constructor(game) {
+    this.game = game;
+    this.pos = { x: 0, y: 60, z: 0 };
+    this.vel = { x: 0, y: 0, z: 0 };
+    this.w = 0.3; this.h = 1.8; this.eye = 1.62;
+    this.yaw = 0; this.pitch = 0;
+    this.mode = 'survival';
+    this.flying = false;
+    this.sprint = false; this.sneak = false;
+    this.onGround = false;
+    this.inWater = false; this.headInWater = false;
+    this.hp = 20; this.air = 10;
+    this.dead = false;
+    this.keys = new Set();
+    this.hotbar = new Array(9).fill(null);   // {id, count}
+    this.backpack = new Array(27).fill(null);
+    this.selected = 0;
+    this.fallPeak = null;
+    this.lastSpace = 0; this.lastW = 0;
+    this.bobPhase = 0; this.bobAmp = 0;
+    this.stepDist = 0;
+    this.damageCd = 0; this.regenT = 0; this.drownT = 0; this.voidT = 0;
+    this.swingT = 1; // >=1 表示无挥动
+    this.heldId = -1; this.heldMesh = null;
+    this.spawn = { x: 0.5, y: 60, z: 0.5 };
+    this.forward = { x: 0, z: -1 };
+  }
+
+  // ---------- 背包 ----------
+  addItem(id, count = 1) {
+    const all = [...this.hotbar.map((s, i) => [s, i, 'h']), ...this.backpack.map((s, i) => [s, i, 'b'])];
+    for (const [s] of all) if (s && s.id === id && s.count < 64) {
+      const add = Math.min(64 - s.count, count);
+      s.count += add; count -= add;
+      if (count <= 0) { this.game.ui.refreshHotbar(); return true; }
+    }
+    for (const [s, i, where] of all) {
+      if (!s) {
+        const put = Math.min(64, count);
+        const slot = { id, count: put };
+        if (where === 'h') this.hotbar[i] = slot; else this.backpack[i] = slot;
+        count -= put;
+        if (count <= 0) { this.game.ui.refreshHotbar(); return true; }
+      }
+    }
+    this.game.ui.refreshHotbar();
+    return count <= 0;
+  }
+
+  consumeHeld() {
+    const s = this.hotbar[this.selected];
+    if (!s) return;
+    if (--s.count <= 0) this.hotbar[this.selected] = null;
+    this.game.ui.refreshHotbar();
+  }
+
+  heldItem() { return this.hotbar[this.selected]; }
+
+  // ---------- 输入 ----------
+  onKey(code, down, repeat) {
+    if (down && !repeat) {
+      if (code === 'Space') {
+        const now = performance.now();
+        if (now - this.lastSpace < 280 && this.mode === 'creative') {
+          this.flying = !this.flying; this.vel.y = 0;
+          this.game.ui.toast(this.flying ? '飞行模式：开' : '飞行模式：关');
+        }
+        this.lastSpace = now;
+      }
+      if (code === 'KeyW') {
+        const now = performance.now();
+        if (now - this.lastW < 280) this.sprint = true;
+        this.lastW = now;
+      }
+      if (code.startsWith('Digit')) {
+        const n = +code.slice(5);
+        if (n >= 1 && n <= 9) { this.selected = n - 1; this.game.ui.refreshHotbar(); this.updateHeldMesh(true); }
+      }
+      if (code === 'KeyQ') this.game.dropHeld();
+      if (code === 'KeyF' && this.mode === 'creative') {
+        this.flying = !this.flying; this.vel.y = 0;
+        this.game.ui.toast(this.flying ? '飞行模式：开' : '飞行模式：关');
+      }
+    }
+    if (down) this.keys.add(code); else this.keys.delete(code);
+    if (!down && code === 'KeyW') this.sprint = false;
+    this.sneak = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
+  }
+
+  // ---------- 物理与移动 ----------
+  update(dt, world) {
+    if (this.dead) return;
+    this.damageCd = Math.max(0, this.damageCd - dt);
+    const k = this.keys;
+    let mx = 0, mz = 0;
+    if (k.has('KeyW')) mz -= 1;
+    if (k.has('KeyS')) mz += 1;
+    if (k.has('KeyA')) mx -= 1;
+    if (k.has('KeyD')) mx += 1;
+    if (!k.has('KeyW')) this.sprint = false;
+    const len = Math.hypot(mx, mz);
+    if (len > 0) { mx /= len; mz /= len; }
+    // 旋转到世界坐标（yaw: 0 = -z）
+    const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
+    const wx = mx * cos - mz * sin;
+    const wz = mx * sin + mz * cos;
+
+    let speed = this.sneak ? SNEAK : this.sprint ? SPRINT : WALK;
+    if (this.flying) speed = this.sprint ? FLY_SPRINT : FLY;
+    if (this.inWater && !this.flying) speed *= 0.55;
+
+    const accel = this.flying ? 12 : this.onGround ? 22 : 3.2;
+    const f = 1 - Math.exp(-accel * dt);
+    this.vel.x += (wx * speed - this.vel.x) * f;
+    this.vel.z += (wz * speed - this.vel.z) * f;
+
+    if (this.flying) {
+      let vy = 0;
+      if (k.has('Space')) vy += speed;
+      if (k.has('ShiftLeft') || k.has('ShiftRight')) vy -= speed;
+      this.vel.y += (vy - this.vel.y) * (1 - Math.exp(-12 * dt));
+      this.fallPeak = null;
+    } else if (this.inWater) {
+      if (k.has('Space')) this.vel.y += (3.6 - this.vel.y) * (1 - Math.exp(-8 * dt));
+      this.fallPeak = null;
+    } else if (k.has('Space') && this.onGround) {
+      this.vel.y = JUMP_V;
+      if (this.sprint) { this.vel.x += wx * 1.8; this.vel.z += wz * 1.8; }
+    }
+
+    // 潜行防坠：逐轴限制
+    if (this.sneak && this.onGround && !this.flying) {
+      if (wx !== 0 && !hasSupport(world, this, this.vel.x * dt, 0)) this.vel.x = 0;
+      if (wz !== 0 && !hasSupport(world, this, 0, this.vel.z * dt)) this.vel.z = 0;
+    }
+
+    const sub = Math.max(1, Math.ceil(dt / 0.017));
+    const sdt = dt / sub;
+    for (let i = 0; i < sub; i++) {
+      const wasGround = this.onGround;
+      stepEntity(world, this, 32, null, sdt);
+      this.onGround = wasGround || onGroundCheck(world, this);
+      if (this.flying) this.onGround = false;
+      // 摔落
+      if (!this.flying && !this.inWater) {
+        if (!this.onGround) {
+          this.fallPeak = this.fallPeak === null ? this.pos.y : Math.max(this.fallPeak, this.pos.y);
+        } else if (this.fallPeak !== null) {
+          const d = this.fallPeak - this.pos.y;
+          this.fallPeak = null;
+          if (d > 3.2) this.damage(Math.floor(d - 3), '摔落');
+        }
+      } else this.fallPeak = null;
+    }
+
+    // 溺水
+    if (this.headInWater) {
+      this.air -= dt / 1.4;
+      if (this.air < 0) {
+        this.air = 0;
+        this.drownT += dt;
+        if (this.drownT > 1) { this.drownT = 0; this.damage(2, '溺水'); }
+      }
+    } else { this.air = Math.min(10, this.air + dt * 3); this.drownT = 0; }
+    // 虚空
+    if (this.pos.y < -12) {
+      this.voidT += dt;
+      if (this.voidT > 0.4) { this.voidT = 0; this.damage(4, '虚空'); }
+    }
+    // 回血
+    if (this.hp > 0 && this.hp < 20) {
+      this.regenT += dt;
+      if (this.regenT > 4) { this.regenT = 0; this.hp = Math.min(20, this.hp + 1); this.game.ui.refreshVitals(); }
+    }
+
+    // 脚步声
+    if (this.onGround && !this.flying) {
+      this.stepDist += Math.hypot(this.vel.x, this.vel.z) * dt;
+      if (this.stepDist > 2.1) {
+        this.stepDist = 0;
+        const under = world.getBlock(Math.floor(this.pos.x), Math.floor(this.pos.y - 0.4), Math.floor(this.pos.z));
+        if (under) this.game.sound.play('step', { mat: blockInfo(under).snd });
+      }
+    }
+    if (this.pos.y < -40) this.respawn();
+
+    // 相机摆动
+    const hSpeed = Math.hypot(this.vel.x, this.vel.z);
+    if (this.onGround && hSpeed > 0.5) {
+      this.bobPhase += dt * hSpeed * 1.75;
+      this.bobAmp = Math.min(1, this.bobAmp + dt * 6);
+    } else this.bobAmp = Math.max(0, this.bobAmp - dt * 6);
+
+    this.updateCamera();
+    if (this.swingT < 1) this.swingT = Math.min(1, this.swingT + dt / 0.28);
+    this.updateHeldMesh(false);
+  }
+
+  updateCamera() {
+    const cam = this.game.camera;
+    const eyeH = this.sneak ? this.eye - 0.13 : this.eye;
+    const bobY = Math.abs(Math.sin(this.bobPhase)) * 0.055 * this.bobAmp;
+    const bobX = Math.sin(this.bobPhase) * 0.035 * this.bobAmp;
+    cam.position.set(
+      this.pos.x + Math.cos(this.yaw) * bobX,
+      this.pos.y + eyeH + bobY,
+      this.pos.z - Math.sin(this.yaw) * bobX
+    );
+    cam.rotation.order = 'YXZ';
+    cam.rotation.y = this.yaw;
+    cam.rotation.x = this.pitch;
+    // 冲刺 FOV
+    const targetFov = this.sprint && !this.sneak ? 80 : 72;
+    if (Math.abs(cam.fov - targetFov) > 0.3) {
+      cam.fov += (targetFov - cam.fov) * 0.18;
+      cam.updateProjectionMatrix();
+    }
+  }
+
+  swing() { if (this.swingT >= 1) this.swingT = 0; }
+
+  eyePos() {
+    return { x: this.pos.x, y: this.pos.y + (this.sneak ? this.eye - 0.13 : this.eye), z: this.pos.z };
+  }
+
+  lookDir() {
+    return {
+      x: -Math.sin(this.yaw) * Math.cos(this.pitch),
+      y: Math.sin(this.pitch),
+      z: -Math.cos(this.yaw) * Math.cos(this.pitch),
+    };
+  }
+
+  damage(n, cause) {
+    if (n <= 0 || this.dead || this.damageCd > 0 || this.mode === 'creative') return;
+    this.damageCd = 0.55;
+    this.hp = Math.max(0, this.hp - n);
+    this.game.sound.play('hurt');
+    this.game.ui.refreshVitals();
+    this.game.ui.damageFlash();
+    if (this.hp <= 0) { this.dead = true; this.game.onPlayerDeath(cause); }
+  }
+
+  respawn() {
+    this.pos = { ...this.spawn };
+    this.vel = { x: 0, y: 0, z: 0 };
+    this.hp = 20; this.air = 10; this.dead = false;
+    this.fallPeak = null;
+    this.flying = false;
+    this.game.ui.refreshVitals();
+  }
+
+  // ---------- 手持方块 ----------
+  buildHeldMesh(atlas) {
+    const item = this.heldItem();
+    const id = item ? item.id : -1;
+    if (id === this.heldId) return;
+    this.heldId = id;
+    if (this.heldMesh) { this.game.camera.remove(this.heldMesh); this.heldMesh = null; }
+    if (!id) return;
+    const info = blockInfo(id);
+    // 独立无顶点色材质，亮度由昼夜驱动
+    const mat = new THREE.MeshBasicMaterial({ map: atlas.tex });
+    if (info.cross || info.item) {
+      mat.alphaTest = 0.4; mat.side = THREE.DoubleSide;
+      const g2 = new THREE.PlaneGeometry(0.42, 0.42);
+      this.applyTileUV(g2, atlas, info.tiles.all);
+      this.heldMesh = new THREE.Mesh(g2, mat);
+    } else {
+      const geo = new THREE.BoxGeometry(0.34, 0.34, 0.34);
+      this.applyBoxUV(geo, atlas, info.tiles);
+      this.heldMesh = new THREE.Mesh(geo, mat);
+    }
+    this.heldMesh.renderOrder = 10;
+    this.heldMesh.frustumCulled = false;
+    this.game.camera.add(this.heldMesh);
+  }
+
+  applyBoxUV(geo, atlas, tiles) {
+    const uv = geo.attributes.uv;
+    const faceTiles = [
+      tiles.side || tiles.all, tiles.side || tiles.all,
+      tiles.top || tiles.all, tiles.bottom || tiles.all,
+      tiles.side || tiles.all, tiles.side || tiles.all,
+    ];
+    for (let f = 0; f < 6; f++) {
+      const name = faceTiles[f];
+      const [u0, u1] = tileUVh(atlas, atlas.tileIndex[name]);
+      const [v0, v1] = tileUVv(atlas, atlas.tileIndex[name]);
+      for (let vI = 0; vI < 4; vI++) {
+        const i = f * 4 + vI;
+        const u = uv.getX(i), v = uv.getY(i);
+        uv.setXY(i, u0 + u * (u1 - u0), v0 + (1 - v) * (v1 - v0));
+      }
+    }
+    uv.needsUpdate = true;
+  }
+
+  applyTileUV(geo, atlas, name) {
+    const uv = geo.attributes.uv;
+    const [u0, u1] = tileUVh(atlas, atlas.tileIndex[name]);
+    const [v0, v1] = tileUVv(atlas, atlas.tileIndex[name]);
+    for (let i = 0; i < uv.count; i++) {
+      const u = uv.getX(i), v = uv.getY(i);
+      uv.setXY(i, u0 + u * (u1 - u0), v0 + (1 - v) * (v1 - v0));
+    }
+    uv.needsUpdate = true;
+  }
+
+  updateHeldMesh(force) {
+    this.buildHeldMesh(this.game.atlas);
+    const m = this.heldMesh;
+    if (!m) return;
+    // 昼夜亮度
+    const day = 0.14 + 0.86 * this.game.sky.dayLight;
+    m.material.color.setScalar(day);
+    const sw = this.swingT < 1 ? Math.sin(this.swingT * Math.PI) : 0;
+    const bob = Math.sin(this.bobPhase) * 0.02 * this.bobAmp;
+    const bobY = Math.abs(Math.sin(this.bobPhase)) * 0.02 * this.bobAmp;
+    m.position.set(0.4 - sw * 0.12, -0.36 + bobY - sw * 0.16, -0.58 + bob);
+    m.rotation.set(-sw * 1.15, 0.72 - sw * 0.5, sw * 0.35);
+    m.visible = true;
+  }
+}

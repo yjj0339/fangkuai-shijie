@@ -1,0 +1,152 @@
+// ===== 天空：穹顶渐变、日月、星星、云、雾、昼夜循环 =====
+import * as THREE from 'three';
+import { clamp, lerp } from './math.js';
+
+const DAY_LENGTH = 600; // 全天 10 分钟
+const SKY_R = 420;
+
+const C = {
+  dayTop: new THREE.Color(0x69A2FF),
+  dayHor: new THREE.Color(0xBFD8FF),
+  nightTop: new THREE.Color(0x04070F),
+  nightHor: new THREE.Color(0x0A1224),
+  duskHor: new THREE.Color(0xFF9A4D),
+  duskTop: new THREE.Color(0x35427E),
+};
+
+export class Sky {
+  constructor(scene, skyTex) {
+    this.scene = scene;
+    this.timeOfDay = 0.12; // 清晨开始
+    this.dayLight = 1;
+
+    // 天空穹顶
+    this.skyUniforms = {
+      topColor: { value: new THREE.Color(0x69A2FF) },
+      bottomColor: { value: new THREE.Color(0xBFD8FF) },
+    };
+    const skyGeo = new THREE.SphereGeometry(SKY_R, 24, 14);
+    const skyMat = new THREE.ShaderMaterial({
+      uniforms: this.skyUniforms,
+      side: THREE.BackSide,
+      depthWrite: false,
+      vertexShader: `
+        varying vec3 vPos;
+        void main() {
+          vPos = position;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: `
+        uniform vec3 topColor;
+        uniform vec3 bottomColor;
+        varying vec3 vPos;
+        void main() {
+          float h = normalize(vPos).y;
+          float t = smoothstep(-0.06, 0.42, h);
+          gl_FragColor = vec4(mix(bottomColor, topColor, t), 1.0);
+        }`,
+    });
+    this.dome = new THREE.Mesh(skyGeo, skyMat);
+    this.dome.renderOrder = -10;
+    scene.add(this.dome);
+
+    // 太阳 / 月亮
+    this.sun = new THREE.Mesh(
+      new THREE.PlaneGeometry(52, 52),
+      new THREE.MeshBasicMaterial({ map: skyTex.sun, transparent: true, depthWrite: false, fog: false })
+    );
+    this.moon = new THREE.Mesh(
+      new THREE.PlaneGeometry(38, 38),
+      new THREE.MeshBasicMaterial({ map: skyTex.moon, transparent: true, depthWrite: false, fog: false })
+    );
+    this.sun.renderOrder = -9;
+    this.moon.renderOrder = -9;
+    scene.add(this.sun, this.moon);
+
+    // 星星
+    const starPos = [];
+    for (let i = 0; i < 420; i++) {
+      const v = new THREE.Vector3().randomDirection().multiplyScalar(SKY_R * 0.92);
+      if (v.y < 10) v.y = Math.abs(v.y) + 10;
+      starPos.push(v.x, v.y, v.z);
+    }
+    const starGeo = new THREE.BufferGeometry();
+    starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starPos, 3));
+    this.starMat = new THREE.PointsMaterial({
+      color: 0xffffff, size: 2.2, sizeAttenuation: false,
+      transparent: true, opacity: 0, depthWrite: false, fog: false,
+    });
+    this.stars = new THREE.Points(starGeo, this.starMat);
+    this.stars.renderOrder = -9;
+    scene.add(this.stars);
+
+    // 云层
+    this.cloudMat = new THREE.MeshBasicMaterial({
+      map: skyTex.cloud, transparent: true, opacity: 0.82,
+      depthWrite: false, fog: false, side: THREE.DoubleSide,
+    });
+    this.cloudTex = skyTex.cloud;
+    this.cloudTex.wrapS = this.cloudTex.wrapT = THREE.RepeatWrapping;
+    this.cloudTex.repeat.set(3, 3);
+    this.clouds = new THREE.Mesh(new THREE.PlaneGeometry(900, 900), this.cloudMat);
+    this.clouds.rotation.x = -Math.PI / 2;
+    this.clouds.position.y = 92;
+    this.clouds.renderOrder = -8;
+    scene.add(this.clouds);
+
+    // 雾
+    this.fog = new THREE.Fog(0xBFD8FF, 60, 150);
+    scene.fog = this.fog;
+    this._col = new THREE.Color();
+  }
+
+  setViewDist(chunks) {
+    const far = chunks * 16;
+    this.fog.near = Math.max(24, far * 0.55);
+    this.fog.far = far * 0.98;
+  }
+
+  sunUp() { return Math.sin(this.timeOfDay * Math.PI * 2) > 0; }
+  isNight() { return Math.sin(this.timeOfDay * Math.PI * 2) < -0.08; }
+
+  update(dt, camPos) {
+    this.timeOfDay = (this.timeOfDay + dt / DAY_LENGTH) % 1;
+    const ang = this.timeOfDay * Math.PI * 2;
+    const elev = Math.sin(ang);
+    this.dayLight = clamp((elev + 0.12) / 0.32, 0, 1);
+    const dayL = this.dayLight;
+    // 晨昏因子
+    const duskF = clamp(1 - Math.abs(elev) * 4.2, 0, 1) * clamp((0.5 - Math.abs(elev)) * 6, 0, 1);
+
+    // 天空颜色
+    this.skyUniforms.topColor.value.copy(C.nightTop).lerp(C.dayTop, dayL).lerp(C.duskTop, duskF * 0.55);
+    this.skyUniforms.bottomColor.value.copy(C.nightHor).lerp(C.dayHor, dayL).lerp(C.duskHor, duskF * 0.75);
+
+    // 日月位置（绕玩家）
+    const R = SKY_R * 0.9;
+    const sx = Math.cos(ang) * R, sy = Math.sin(ang) * R;
+    this.sun.position.set(camPos.x + sx, camPos.y + sy, camPos.z - R * 0.25);
+    this.moon.position.set(camPos.x - sx, camPos.y - sy, camPos.z + R * 0.25);
+    this.sun.lookAt(camPos.x, camPos.y, camPos.z);
+    this.moon.lookAt(camPos.x, camPos.y, camPos.z);
+    this.sun.material.opacity = clamp(sy / R * 4 + 0.6, 0, 1);
+    this.moon.material.opacity = clamp(-sy / R * 4 + 0.6, 0, 1);
+
+    // 星星
+    this.starMat.opacity = clamp(1 - dayL * 1.6, 0, 0.95);
+    this.stars.position.set(camPos.x, camPos.y, camPos.z);
+    this.stars.rotation.z = ang * 0.5;
+
+    // 云
+    this.clouds.position.x = camPos.x;
+    this.clouds.position.z = camPos.z;
+    this.cloudTex.offset.x += dt * 0.0022;
+    this.cloudMat.opacity = 0.25 + dayL * 0.6;
+
+    // 雾
+    this._col.copy(C.nightHor).lerp(C.dayHor, dayL).lerp(C.duskHor, duskF * 0.6);
+    this.fog.color.copy(this._col);
+
+    this.dome.position.copy(camPos);
+  }
+}

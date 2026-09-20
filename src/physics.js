@@ -1,0 +1,87 @@
+// ===== 体素物理：AABB 逐轴碰撞 =====
+import { B, isSolid } from './blocks.js';
+
+const EPS = 0.0015;
+
+// e: { pos:{x,y,z}(脚底中心), vel:{x,y,z}, w(半宽), h(高), onGround, inWater, headInWater }
+export function isSolidAt(world, x, y, z) {
+  return isSolid(world.getBlock(Math.floor(x), Math.floor(y), Math.floor(z)));
+}
+
+export function boxCollides(world, minX, minY, minZ, maxX, maxY, maxZ) {
+  const x0 = Math.floor(minX), x1 = Math.floor(maxX);
+  const y0 = Math.floor(minY), y1 = Math.floor(maxY);
+  const z0 = Math.floor(minZ), z1 = Math.floor(maxZ);
+  for (let y = y0; y <= y1; y++)
+    for (let z = z0; z <= z1; z++)
+      for (let x = x0; x <= x1; x++)
+        if (isSolid(world.getBlock(x, y, z))) return true;
+  return false;
+}
+
+function collideAxis(world, e, axis, amount) {
+  if (amount === 0) return false;
+  e.pos[axis] += amount;
+  const minX = e.pos.x - e.w, maxX = e.pos.x + e.w;
+  const minY = e.pos.y, maxY = e.pos.y + e.h;
+  const minZ = e.pos.z - e.w, maxZ = e.pos.z + e.w;
+  if (!boxCollides(world, minX, minY, minZ, maxX, maxY, maxZ)) return false;
+  // 回退到贴面
+  if (axis === 'y') {
+    if (amount > 0) e.pos.y = Math.floor(maxY) - e.h - EPS;
+    else e.pos.y = Math.floor(minY) + 1 + EPS;
+  } else if (axis === 'x') {
+    if (amount > 0) e.pos.x = Math.floor(maxX) - e.w - EPS;
+    else e.pos.x = Math.floor(minX) + 1 + e.w + EPS;
+  } else {
+    if (amount > 0) e.pos.z = Math.floor(maxZ) - e.w - EPS;
+    else e.pos.z = Math.floor(minZ) + 1 + e.w + EPS;
+  }
+  return true;
+}
+
+export function checkWater(world, e) {
+  const x = Math.floor(e.pos.x), z = Math.floor(e.pos.z);
+  e.inWater = world.getBlock(x, Math.floor(e.pos.y + 0.2), z) === B.WATER ||
+    world.getBlock(x, Math.floor(e.pos.y + e.h * 0.5), z) === B.WATER;
+  e.headInWater = world.getBlock(x, Math.floor(e.pos.y + e.h * 0.85), z) === B.WATER;
+}
+
+// 单步物理（dt ≈ 1/60，位移 = 速度 × dt）
+export function stepEntity(world, e, gravity = 32, drag = null, dt = 1 / 60) {
+  checkWater(world, e);
+  const k60 = dt * 60;
+  if (e.inWater) {
+    e.vel.y -= gravity * 0.28 * dt;
+    e.vel.y *= Math.pow(0.92, k60);
+    e.vel.x *= Math.pow(0.86, k60); e.vel.z *= Math.pow(0.86, k60);
+  } else {
+    e.vel.y -= gravity * dt;
+    if (drag) { e.vel.x *= Math.pow(drag, k60); e.vel.z *= Math.pow(drag, k60); }
+  }
+  e.vel.y = Math.max(e.vel.y, -78);
+
+  const hitY = collideAxis(world, e, 'y', e.vel.y * dt);
+  if (hitY) {
+    if (e.vel.y < 0) e.onGround = true;
+    e.vel.y = 0;
+  } else if (e.vel.y < -0.1 * dt) {
+    e.onGround = false;
+  }
+  const hitX = collideAxis(world, e, 'x', e.vel.x * dt);
+  if (hitX) e.vel.x = 0;
+  const hitZ = collideAxis(world, e, 'z', e.vel.z * dt);
+  if (hitZ) e.vel.z = 0;
+}
+
+export function onGroundCheck(world, e) {
+  return boxCollides(world, e.pos.x - e.w + 0.02, e.pos.y - 0.06, e.pos.z - e.w + 0.02,
+    e.pos.x + e.w - 0.02, e.pos.y - 0.001, e.pos.z + e.w - 0.02);
+}
+
+export function hasSupport(world, e, moveX, moveZ) {
+  // 潜行防坠：移动后脚下是否有支撑
+  const nx = e.pos.x + moveX, nz = e.pos.z + moveZ;
+  return boxCollides(world, nx - e.w + 0.02, e.pos.y - 0.1, nz - e.w + 0.02,
+    nx + e.w - 0.02, e.pos.y - 0.001, nz + e.w - 0.02);
+}

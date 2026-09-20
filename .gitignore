@@ -1,0 +1,5 @@
+node_modules/
+shots/
+server.log
+*.log
+.zcode/

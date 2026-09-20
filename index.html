@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>我的世界 · 网页版</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%238a6244'/%3E%3Crect width='16' height='5' fill='%2374b24c'/%3E%3C/svg%3E">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; touch-action: none; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; user-select: none; }
+  img { image-rendering: pixelated; }
+  #game-canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  /* ===== 通用 MC 按钮 ===== */
+  .btn {
+    display: block; width: 320px; max-width: 84vw; margin: 5px auto; padding: 11px 0;
+    font-size: 16px; font-weight: 700; color: #eee; text-align: center; cursor: pointer;
+    background: linear-gradient(#9a9a9a, #7a7a7a 45%, #6e6e6e);
+    border: 2px solid #000; box-shadow: inset 2px 2px 0 rgba(255,255,255,.35), inset -2px -2px 0 rgba(0,0,0,.45);
+    text-shadow: 2px 2px 0 #3f3f3f;
+  }
+  .btn:hover { background: linear-gradient(#a8b0e8, #8088c8 45%, #7078b8); color: #ffffa0; }
+  .btn:active { box-shadow: inset -2px -2px 0 rgba(255,255,255,.3), inset 2px 2px 0 rgba(0,0,0,.45); }
+
+  /* ===== 标题屏 ===== */
+  #title-screen {
+    position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 4px;
+    background-color: #3a2a1a; background-size: 72px 72px; image-rendering: pixelated;
+  }
+  #title-screen::before { content: ''; position: absolute; inset: 0; background: rgba(0,0,0,.42); }
+  #logo {
+    position: relative; font-size: clamp(44px, 9vw, 84px); font-weight: 900; letter-spacing: 6px;
+    color: #e8e8e8; text-shadow: 4px 4px 0 #2a2a2a, -2px -2px 0 #555;
+    -webkit-text-stroke: 2px #1a1a1a; margin-bottom: 2px;
+  }
+  #splash {
+    position: relative; color: #ffff55; font-weight: 700; font-size: 15px;
+    text-shadow: 2px 2px 0 #3f3f00; transform: rotate(-6deg);
+    animation: splash 0.9s ease-in-out infinite alternate; margin-bottom: 26px;
+  }
+  @keyframes splash { from { transform: rotate(-6deg) scale(1); } to { transform: rotate(-6deg) scale(1.08); } }
+  #title-screen .btn { position: relative; }
+  #title-footer {
+    position: absolute; bottom: 10px; width: 100%; text-align: center;
+    color: #aaa; font-size: 12px; text-shadow: 1px 1px 0 #000;
+  }
+
+  /* ===== HUD ===== */
+  #hud { position: fixed; inset: 0; z-index: 10; pointer-events: none; display: none; }
+  #crosshair { position: absolute; left: 50%; top: 50%; width: 22px; height: 22px; transform: translate(-50%,-50%); mix-blend-mode: difference; }
+  #crosshair::before, #crosshair::after { content: ''; position: absolute; background: #ddd; }
+  #crosshair::before { left: 50%; top: 0; width: 2px; height: 100%; transform: translateX(-50%); }
+  #crosshair::after { top: 50%; left: 0; height: 2px; width: 100%; transform: translateY(-50%); }
+
+  #hotbar {
+    position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%);
+    display: flex; pointer-events: auto;
+    background: rgba(20,20,20,.55); border: 2px solid rgba(160,160,160,.8); padding: 2px;
+  }
+  #hotbar .slot, .inv-grid .slot {
+    width: 52px; height: 52px; position: relative; display: flex; align-items: center; justify-content: center;
+    background: rgba(60,60,60,.5); border: 1px solid rgba(140,140,140,.6); margin: 1px; cursor: pointer;
+  }
+  #hotbar .slot img, .inv-grid .slot img, #cursor-item img { width: 40px; height: 40px; }
+  #hotbar .slot.sel { border: 3px solid #fff; background: rgba(200,200,200,.25); }
+  .count {
+    position: absolute; right: 3px; bottom: 1px; color: #fff; font-weight: 800; font-size: 15px;
+    text-shadow: 1.5px 1.5px 0 #000; font-family: monospace;
+  }
+  #item-name {
+    position: absolute; left: 50%; bottom: 78px; transform: translateX(-50%);
+    color: #fff; font-weight: 700; font-size: 17px; text-shadow: 2px 2px 0 #000;
+    opacity: 0; transition: opacity .5s;
+  }
+  #hearts { position: absolute; left: 50%; bottom: 68px; transform: translateX(-262px); display: flex; gap: 1px; }
+  #hearts .heart { width: 20px; height: 20px; }
+  #bubbles { position: absolute; right: 50%; bottom: 68px; transform: translateX(262px); display: flex; gap: 1px; flex-direction: row-reverse; }
+  #bubbles .bubble { width: 20px; height: 20px; }
+  #toast {
+    position: absolute; left: 50%; top: 18%; transform: translateX(-50%);
+    color: #fff; font-size: 16px; font-weight: 700; text-shadow: 2px 2px 0 #000;
+    background: rgba(0,0,0,.4); padding: 8px 18px; opacity: 0; transition: opacity .6s; max-width: 80vw; text-align: center;
+  }
+  #debug {
+    position: absolute; left: 6px; top: 6px; color: #fff; font-size: 13px; line-height: 1.5;
+    font-family: monospace; text-shadow: 1px 1px 0 #000; background: rgba(0,0,0,.3);
+    padding: 6px 9px; display: none; white-space: pre-wrap;
+  }
+  #debug.show { display: block; }
+  #water-overlay { position: absolute; inset: 0; background: #1a3a6a; opacity: 0; transition: opacity .25s; }
+  #damage-overlay { position: absolute; inset: 0; background: radial-gradient(ellipse, rgba(255,0,0,.25), rgba(180,0,0,.6)); opacity: 0; transition: opacity .3s; }
+
+  /* ===== 触屏控件 ===== */
+  #touch-ui { position: fixed; inset: 0; z-index: 20; pointer-events: none; display: none; }
+  body.touch #touch-ui { display: block; }
+  #joy {
+    position: absolute; left: 26px; bottom: 86px; width: 128px; height: 128px; border-radius: 50%;
+    background: rgba(255,255,255,.12); border: 2px solid rgba(255,255,255,.35); pointer-events: auto;
+  }
+  #joy-knob {
+    position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; border-radius: 50%;
+    background: rgba(255,255,255,.45); transform: translate(-50%,-50%); margin-left: -27px; margin-top: -27px;
+    left: 50%; top: 50%;
+  }
+  .tbtn {
+    position: absolute; pointer-events: auto; width: 62px; height: 62px; border-radius: 12px;
+    background: rgba(255,255,255,.16); border: 2px solid rgba(255,255,255,.4);
+    color: #fff; font-size: 14px; font-weight: 800; display: flex; align-items: center; justify-content: center;
+    text-shadow: 1px 1px 0 #000;
+  }
+  .tbtn.on { background: rgba(255,255,255,.45); }
+  #jump-btn { right: 30px; bottom: 110px; }
+  #sneak-btn { right: 108px; bottom: 78px; }
+  #fly-up-btn { right: 30px; bottom: 188px; }
+  #fly-down-btn { right: 108px; bottom: 156px; display: none; }
+  #fly-toggle-btn { right: 30px; bottom: 266px; width: 54px; height: 40px; font-size: 12px; display: none; }
+  #inv-btn { right: 16px; top: 12px; width: 52px; height: 40px; font-size: 13px; }
+  #pause-btn { right: 76px; top: 12px; width: 52px; height: 40px; font-size: 13px; }
+  #debug-btn { left: 12px; top: 12px; width: 52px; height: 40px; font-size: 12px; }
+  body.touch #hotbar { bottom: 4px; }
+  body.touch #hotbar .slot { width: 42px; height: 42px; }
+  body.touch #hotbar .slot img { width: 32px; height: 32px; }
+  body.touch #hearts { left: 12px; bottom: 60px; transform: none; }
+  body.touch #bubbles { right: 12px; bottom: 60px; transform: none; }
+  body.creative-touch #fly-up-btn, body.creative-touch #fly-down-btn, body.creative-touch #fly-toggle-btn { display: flex; }
+
+  /* ===== 菜单面板 ===== */
+  .screen {
+    position: fixed; inset: 0; z-index: 60; display: none; flex-direction: column;
+    align-items: center; justify-content: center;
+  }
+  #pause-menu { background: rgba(20,20,20,.6); backdrop-filter: blur(2px); }
+  #pause-menu h2, #death-screen h1 { color: #fff; text-shadow: 2px 2px 0 #000; margin-bottom: 18px; font-size: 30px; }
+  #loading { background: #2a1f14; z-index: 70; }
+  .dirt-panel { text-align: center; color: #eee; font-size: 18px; font-weight: 700; text-shadow: 2px 2px 0 #000; }
+  .load-bar-wrap { width: 300px; height: 14px; border: 2px solid #888; margin-top: 14px; background: #111; }
+  #load-bar { height: 100%; width: 0; background: #6faa4c; }
+
+  #death-screen { background: rgba(120, 10, 10, .55); z-index: 65; }
+  #death-cause { color: #eee; margin-bottom: 22px; text-shadow: 1px 1px 0 #000; }
+
+  /* ===== 背包 ===== */
+  #inventory { background: rgba(0,0,0,.5); z-index: 55; }
+  .inv-panel {
+    background: #c6c6c6; border: 3px solid; border-color: #fff #555 #555 #fff;
+    padding: 14px; max-width: 94vw; max-height: 86vh; overflow: auto;
+  }
+  .inv-panel h3 { color: #3a3a3a; font-size: 16px; margin-bottom: 10px; }
+  .inv-grid { display: flex; flex-wrap: wrap; max-width: 500px; }
+  .inv-grid .slot { background: #8b8b8b; border: 2px solid; border-color: #555 #fff #fff #555; }
+  .inv-grid .slot:hover { background: #a5a5a5; }
+  .inv-sep { height: 12px; }
+  #cursor-item { position: fixed; z-index: 80; pointer-events: none; display: none; }
+  #cursor-item img { width: 40px; height: 40px; }
+  #palette { max-height: 40vh; overflow-y: auto; }
+
+  /* ===== 帮助 ===== */
+  #help-panel {
+    position: fixed; inset: 0; z-index: 90; background: rgba(0,0,0,.7);
+    display: none; align-items: center; justify-content: center;
+  }
+  .help-box { background: #e8e8e8; color: #222; padding: 20px 26px; max-width: 520px; max-height: 84vh; overflow: auto; border: 3px solid; border-color: #fff #666 #666 #fff; }
+  .help-box h3 { margin-bottom: 10px; }
+  .help-box table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  .help-box td { padding: 4px 8px; border-bottom: 1px solid #ccc; }
+  .help-box td:first-child { font-weight: 800; white-space: nowrap; color: #1a5c1a; }
+  .help-box .btn { width: 100%; margin-top: 14px; }
+
+  /* ===== 聊天 ===== */
+  #chat-bar { position: fixed; left: 8px; right: 8px; bottom: 70px; z-index: 58; display: none; }
+  #chat-input {
+    width: 100%; padding: 9px 12px; font-size: 15px; background: rgba(0,0,0,.65);
+    border: 1px solid #888; color: #fff; outline: none;
+  }
+</style>
+</head>
+<body>
+  <canvas id="game-canvas"></canvas>
+
+  <!-- HUD -->
+  <div id="hud">
+    <div id="water-overlay"></div>
+    <div id="damage-overlay"></div>
+    <div id="crosshair"></div>
+    <div id="hearts"></div>
+    <div id="bubbles"></div>
+    <div id="item-name"></div>
+    <div id="hotbar"></div>
+    <div id="toast"></div>
+    <div id="debug"></div>
+  </div>
+
+  <!-- 触屏 -->
+  <div id="touch-ui">
+    <div id="joy"><div id="joy-knob"></div></div>
+    <div class="tbtn" id="jump-btn">跳</div>
+    <div class="tbtn" id="sneak-btn">潜</div>
+    <div class="tbtn" id="fly-up-btn">▲</div>
+    <div class="tbtn" id="fly-down-btn">▼</div>
+    <div class="tbtn" id="fly-toggle-btn">飞行</div>
+    <div class="tbtn" id="inv-btn">背包</div>
+    <div class="tbtn" id="pause-btn">暂停</div>
+    <div class="tbtn" id="debug-btn">信息</div>
+  </div>
+
+  <!-- 标题屏 -->
+  <div id="title-screen">
+    <div id="logo">我的世界</div>
+    <div id="splash"></div>
+    <button class="btn" id="btn-continue">继续游戏</button>
+    <button class="btn" id="btn-survival">新的世界 · 生存模式</button>
+    <button class="btn" id="btn-creative">新的世界 · 创造模式</button>
+    <button class="btn" id="btn-help">操作说明</button>
+    <div id="title-footer">致敬 Mojang《Minecraft》的纯网页复刻 · 全程序化生成 · 支持手机触屏</div>
+  </div>
+
+  <!-- 加载 -->
+  <div class="screen" id="loading">
+    <div class="dirt-panel">正在生成世界……
+      <div class="load-bar-wrap"><div id="load-bar"></div></div>
+    </div>
+  </div>
+
+  <!-- 暂停 -->
+  <div class="screen" id="pause-menu">
+    <h2>游戏菜单</h2>
+    <button class="btn" id="btn-resume">回到游戏</button>
+    <button class="btn" id="btn-mode">模式：生存</button>
+    <button class="btn" id="btn-pause-help">操作说明</button>
+    <button class="btn" id="btn-newworld">重置世界（新存档）</button>
+  </div>
+
+  <!-- 背包 -->
+  <div class="screen" id="inventory">
+    <div class="inv-panel">
+      <h3 id="inv-title">背包</h3>
+      <div id="inv-body"></div>
+    </div>
+  </div>
+  <div id="cursor-item"></div>
+
+  <!-- 死亡 -->
+  <div class="screen" id="death-screen">
+    <h1>你死了！</h1>
+    <div id="death-cause"></div>
+    <button class="btn" id="btn-respawn">重生</button>
+  </div>
+
+  <!-- 帮助 -->
+  <div id="help-panel">
+    <div class="help-box">
+      <h3>操作说明</h3>
+      <table>
+        <tr><td>W A S D</td><td>移动（双击 W 冲刺）</td></tr>
+        <tr><td>空格</td><td>跳跃 / 游泳上浮 / 飞行上升（双击空格切换飞行·创造）</td></tr>
+        <tr><td>Shift</td><td>潜行（防坠落）/ 飞行下降</td></tr>
+        <tr><td>鼠标左键</td><td>挖掘方块（按住，带裂缝进度）</td></tr>
+        <tr><td>鼠标右键</td><td>放置方块 / 吃食物 / 点燃 TNT</td></tr>
+        <tr><td>鼠标中键</td><td>选取指向的方块</td></tr>
+        <tr><td>滚轮 / 1-9</td><td>切换快捷栏</td></tr>
+        <tr><td>E</td><td>背包 / 创造物品栏</td></tr>
+        <tr><td>Q</td><td>丢弃手中物品</td></tr>
+        <tr><td>F3</td><td>调试信息</td></tr>
+        <tr><td>T 或 /</td><td>聊天与命令：/time set day · /gamemode c · /tp x y z</td></tr>
+        <tr><td>手机端</td><td>左摇杆移动 · 右侧滑动转视角 · 点按放置 · 长按挖掘</td></tr>
+      </table>
+      <p style="margin-top:10px;font-size:13px;color:#555">提示：夜晚会刷僵尸，动物（猪/牛/羊）可掉落食物和羊毛；挖到 64 层以下能找到钻石矿；TNT 会连锁爆炸。</p>
+      <button class="btn" id="help-close">关闭</button>
+    </div>
+  </div>
+
+  <!-- 聊天 -->
+  <div id="chat-bar"><input id="chat-input" placeholder="输入消息或 / 命令…（回车发送，Esc 取消）"></div>
+
+  <script type="importmap">
+  { "imports": { "three": "./vendor/three.module.js" } }
+  </script>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

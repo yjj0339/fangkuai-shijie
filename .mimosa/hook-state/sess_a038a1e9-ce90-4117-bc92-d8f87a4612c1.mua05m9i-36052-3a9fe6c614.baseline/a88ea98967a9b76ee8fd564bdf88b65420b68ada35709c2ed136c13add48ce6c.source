@@ -1,0 +1,223 @@
+// ===== 区块网格化：面剔除 + 方向光照 + 平滑AO + 天光烘焙 =====
+import * as THREE from 'three';
+import { B, blockInfo, isOpaque } from './blocks.js';
+import { tileUVh, tileUVv } from './textures.js';
+import { CH, WH, SEA } from './world.js';
+import { hash2 } from './math.js';
+
+const idx = (x, y, z) => x + (z << 4) + (y << 8);
+
+// 面表：n 法线 / shade 方向亮度 / corners [x,y,z,u,v]（外视 CCW）
+const FACES = [
+  { n: [1, 0, 0], shade: 0.62, corners: [[1, 0, 1, 0, 0], [1, 0, 0, 1, 0], [1, 1, 0, 1, 1], [1, 1, 1, 0, 1]] },
+  { n: [-1, 0, 0], shade: 0.62, corners: [[0, 0, 0, 0, 0], [0, 0, 1, 1, 0], [0, 1, 1, 1, 1], [0, 1, 0, 0, 1]] },
+  { n: [0, 1, 0], shade: 1.0, corners: [[0, 1, 1, 0, 1], [1, 1, 1, 1, 1], [1, 1, 0, 1, 0], [0, 1, 0, 0, 0]] },
+  { n: [0, -1, 0], shade: 0.52, corners: [[0, 0, 0, 0, 0], [1, 0, 0, 1, 0], [1, 0, 1, 1, 1], [0, 0, 1, 0, 1]] },
+  { n: [0, 0, 1], shade: 0.82, corners: [[0, 0, 1, 0, 0], [1, 0, 1, 1, 0], [1, 1, 1, 1, 1], [0, 1, 1, 0, 1]] },
+  { n: [0, 0, -1], shade: 0.82, corners: [[1, 0, 0, 0, 0], [0, 0, 0, 1, 0], [0, 1, 0, 1, 1], [1, 1, 0, 0, 1]] },
+];
+// 每面每角的 AO 三邻居偏移（轴：面法线轴之外的另两轴）
+const AO_OFF = FACES.map(f => {
+  const a = f.n[0] !== 0 ? 0 : f.n[1] !== 0 ? 1 : 2;
+  const ax1 = (a + 1) % 3, ax2 = (a + 2) % 3;
+  return f.corners.map(c => {
+    const s = c[ax1] === 1 ? 1 : -1;
+    const t = c[ax2] === 1 ? 1 : -1;
+    const o1 = [...f.n], o2 = [...f.n], o3 = [...f.n];
+    o1[ax1] += s;
+    o2[ax2] += t;
+    o3[ax1] += s; o3[ax2] += t;
+    return [o1, o2, o3];
+  });
+});
+
+// 天光亮度曲线（MC 感：暗处压得深）
+function lightCurve(l) {
+  const v = l / 15;
+  return 0.06 + 0.94 * Math.pow(v, 1.45);
+}
+
+export function createChunkMaterials(atlas) {
+  const dayUniform = { value: 1.0 };
+  const inject = (mat, twoChannel) => {
+    mat.onBeforeCompile = (sh) => {
+      sh.uniforms.uDay = dayUniform;
+      sh.fragmentShader = 'uniform float uDay;\n' + sh.fragmentShader.replace(
+        '#include <color_fragment>',
+        twoChannel
+          ? '#include <color_fragment>\n diffuseColor.rgb *= (vColor.r * uDay + vColor.g);'
+          : '#include <color_fragment>\n diffuseColor.rgb *= (vColor.r * uDay + vColor.g);'
+      );
+    };
+    mat.customProgramCacheKey = () => 'voxel';
+    return mat;
+  };
+  const opaque = inject(new THREE.MeshBasicMaterial({ map: atlas.tex, vertexColors: true }));
+  const cutout = inject(new THREE.MeshBasicMaterial({
+    map: atlas.tex, vertexColors: true, alphaTest: 0.45, side: THREE.DoubleSide,
+  }));
+  const water = inject(new THREE.MeshBasicMaterial({
+    map: atlas.tex, vertexColors: true, transparent: true, opacity: 0.72,
+    depthWrite: false, side: THREE.DoubleSide,
+  }));
+  return { opaque, cutout, water, dayUniform };
+}
+
+export function buildChunkMeshes(world, atlas, mats, cx, cz) {
+  const chunk = world.getChunk(cx, cz);
+  if (!chunk) return null;
+  const data = chunk.data;
+  const bx = cx * 16, bz = cz * 16;
+
+  // 邻区块快速访问
+  const nXm = world.getChunk(cx - 1, cz), nXp = world.getChunk(cx + 1, cz);
+  const nZm = world.getChunk(cx, cz - 1), nZp = world.getChunk(cx, cz + 1);
+  const getB = (x, y, z) => {
+    if (y < 0) return B.BEDROCK;
+    if (y >= WH) return B.AIR;
+    if (x >= 0 && x < 16 && z >= 0 && z < 16) return data[idx(x, y, z)];
+    if (x < 0) return nXm ? nXm.data[idx(x + 16, y, z)] : B.AIR;
+    if (x > 15) return nXp ? nXp.data[idx(x - 16, y, z)] : B.AIR;
+    if (z < 0) return nZm ? nZm.data[idx(x, y, z + 16)] : B.AIR;
+    return nZp ? nZp.data[idx(x, y, z - 16)] : B.AIR;
+  };
+  const getL = (x, y, z) => {
+    if (y >= WH) return 15;
+    if (y < 0) return 0;
+    if (x >= 0 && x < 16 && z >= 0 && z < 16) return chunk.light[idx(x, y, z)];
+    if (x < 0) return nXm ? nXm.light[idx(x + 16, y, z)] : 15;
+    if (x > 15) return nXp ? nXp.light[idx(x - 16, y, z)] : 15;
+    if (z < 0) return nZm ? nZm.light[idx(x, y, z + 16)] : 15;
+    return nZp ? nZp.light[idx(x, y, z - 16)] : 15;
+  };
+
+  const groups = {
+    opaque: { pos: [], uv: [], col: [], ind: [], vc: 0 },
+    cutout: { pos: [], uv: [], col: [], ind: [], vc: 0 },
+    water: { pos: [], uv: [], col: [], ind: [], vc: 0 },
+  };
+
+  const aoVals = [0.42, 0.62, 0.82, 1.0];
+
+  const pushQuad = (g, corners, uvArr, colors, flip) => {
+    const base = g.vc;
+    for (let i = 0; i < 4; i++) {
+      g.pos.push(corners[i][0], corners[i][1], corners[i][2]);
+      g.uv.push(uvArr[i][0], uvArr[i][1]);
+      g.col.push(colors[i][0], colors[i][1], colors[i][2]);
+    }
+    // AO 各向异性修正：对角翻转
+    if (flip) g.ind.push(base + 1, base + 2, base + 3, base + 1, base + 3, base);
+    else g.ind.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    g.vc += 4;
+  };
+
+  for (let y = 0; y < WH; y++) {
+    for (let z = 0; z < 16; z++) {
+      for (let x = 0; x < 16; x++) {
+        const id = data[idx(x, y, z)];
+        if (id === B.AIR) continue;
+        const info = blockInfo(id);
+        const wx = bx + x, wz = bz + z;
+
+        // ---- 交叉面片植物 ----
+        if (info.cross) {
+          const g = groups.cutout;
+          const [u0, u1] = tileUVh(atlas, atlas.tileIndex[info.tiles.all]);
+          const [v0, v1] = tileUVv(atlas, atlas.tileIndex[info.tiles.all]);
+          const ox = (hash2(wx, wz, 17) - 0.5) * 0.35;
+          const oz = (hash2(wx, wz, 47) - 0.5) * 0.35;
+          const light = lightCurve(getL(x, y, z));
+          const c = [light, 0, 0];
+          const cols = [c, c, c, c];
+          const uvq = [[u0, v1], [u1, v1], [u1, v0], [u0, v0]];
+          const px = wx + 0.5 + ox, pz = wz + 0.5 + oz, py = y, s = 0.45;
+          pushQuad(g, [[px - s, py, pz - s], [px + s, py, pz + s], [px + s, py + 1, pz + s], [px - s, py + 1, pz - s]], uvq, cols, false);
+          pushQuad(g, [[px + s, py, pz - s], [px - s, py, pz + s], [px - s, py + 1, pz + s], [px + s, py + 1, pz - s]], uvq, cols, false);
+          continue;
+        }
+
+        const isWater = id === B.WATER;
+        const g = isWater ? groups.water : (info.cutout || !info.opaque ? groups.cutout : groups.opaque);
+        const glow = info.lum ? 1 : 0;
+
+        for (let f = 0; f < 6; f++) {
+          const face = FACES[f];
+          const nx = x + face.n[0], ny = y + face.n[1], nz = z + face.n[2];
+          const nid = getB(nx, ny, nz);
+          if (isWater) {
+            if (nid === B.WATER) continue;
+            if (isOpaque(nid)) continue;
+          } else {
+            if (isOpaque(nid)) continue;
+            if (nid === id && (id === B.GLASS || id === B.LEAVES || id === B.BIRCH_LEAVES || id === B.SPRUCE_LEAVES)) continue;
+          }
+
+          const tileName = face.n[1] === 1 ? (info.tiles.top || info.tiles.all)
+            : face.n[1] === -1 ? (info.tiles.bottom || info.tiles.all)
+              : (info.tiles.side || info.tiles.all);
+          const tIdx = atlas.tileIndex[tileName];
+          const [u0, u1] = tileUVh(atlas, tIdx);
+          const [v0, v1] = tileUVv(atlas, tIdx);
+
+          // 天光（发光块自带全亮）
+          const skyBase = info.lum ? 1 : lightCurve(getL(nx, ny, nz));
+
+          // 每角：平滑AO + 平滑光
+          const corners = [], uvs = [], colors = [];
+          const aoArr = [];
+          for (let ci = 0; ci < 4; ci++) {
+            const c = face.corners[ci];
+            const [o1, o2, o3] = AO_OFF[f][ci];
+            const s1 = isOpaque(getB(x + o1[0], y + o1[1], z + o1[2])) ? 1 : 0;
+            const s2 = isOpaque(getB(x + o2[0], y + o2[1], z + o2[2])) ? 1 : 0;
+            const cn = isOpaque(getB(x + o3[0], y + o3[1], z + o3[2])) ? 1 : 0;
+            const ao = aoVals[(s1 && s2) ? 0 : 3 - (s1 + s2 + cn)];
+            aoArr.push(ao);
+            // 平滑光：面邻格与两个侧邻格的平均天光
+            const la = info.lum ? 1 : (
+              lightCurve(getL(x + face.n[0], y + face.n[1], z + face.n[2])) * 0.5 +
+              lightCurve(getL(x + o1[0], y + o1[1], z + o1[2])) * 0.25 +
+              lightCurve(getL(x + o2[0], y + o2[1], z + o2[2])) * 0.25
+            );
+            let cy = c[1];
+            if (isWater && cy === 1 && getB(x, y + 1, z) !== B.WATER) cy = 0.875;
+            corners.push([wx + c[0], y + cy, wz + c[2]]);
+            uvs.push([u0 + c[3] * (u1 - u0), v0 + (1 - c[4]) * (v1 - v0)]);
+            colors.push([skyBase * face.shade * ao, glow, 0]);
+          }
+          const flip = aoArr[0] + aoArr[2] < aoArr[1] + aoArr[3];
+          pushQuad(g, corners, uvs, colors, flip);
+        }
+      }
+    }
+  }
+
+  const make = (g, material, renderOrder) => {
+    if (!g.vc) return null;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(g.pos, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(g.uv, 2));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(g.col, 3));
+    geo.setIndex(g.ind);
+    geo.computeBoundingSphere();
+    const mesh = new THREE.Mesh(geo, material);
+    mesh.renderOrder = renderOrder;
+    mesh.matrixAutoUpdate = false;
+    mesh.updateMatrix();
+    return mesh;
+  };
+
+  return {
+    opaque: make(groups.opaque, mats.opaque, 0),
+    cutout: make(groups.cutout, mats.cutout, 0),
+    water: make(groups.water, mats.water, 2),
+  };
+}
+
+export function disposeChunkMeshes(meshes) {
+  if (!meshes) return;
+  for (const m of meshes) {
+    if (m) { m.geometry.dispose(); m.removeFromParent(); }
+  }
+}

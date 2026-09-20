@@ -1,0 +1,293 @@
+// ===== 世界：区块存储、地形生成、天光 =====
+import { Simplex, fbm2, fbm3, mulberry32, hash2, clamp } from './math.js';
+import { B, isSolid, isOpaque, blockInfo } from './blocks.js';
+
+export const CH = 16;    // 区块水平尺寸
+export const WH = 96;    // 世界高度
+export const SEA = 32;   // 海平面
+
+export const BIOME = { OCEAN: 0, BEACH: 1, PLAINS: 2, FOREST: 3, DESERT: 4, SNOW: 5, MOUNTAIN: 6 };
+export const BIOME_NAMES = ['海洋', '海滩', '平原', '森林', '沙漠', '雪原', '山地'];
+
+const idx = (x, y, z) => x + (z << 4) + (y << 8);
+
+export class World {
+  constructor(seed) {
+    this.seed = seed >>> 0;
+    const r = mulberry32(this.seed);
+    this.nCont = new Simplex(r);
+    this.nHill = new Simplex(r);
+    this.nMtn = new Simplex(r);
+    this.nMtnH = new Simplex(r);
+    this.nTemp = new Simplex(r);
+    this.nMoist = new Simplex(r);
+    this.nCave = new Simplex(r);
+    this.nOreA = new Simplex(r);
+    this.nOreB = new Simplex(r);
+    this.chunks = new Map();       // "cx,cz" → chunk
+    this.edits = new Map();        // "x,y,z" → blockId（玩家改动，存档用）
+    this.dirtyQueue = new Set();   // 需要重建网格的区块 key
+  }
+
+  key(cx, cz) { return cx + ',' + cz; }
+
+  // ---------- 地形函数 ----------
+  heightAt(x, z) {
+    const cont = fbm2(this.nCont, x * 0.0017, z * 0.0017, 4) * 15;
+    const hill = fbm2(this.nHill, x * 0.009, z * 0.009, 3) * 5.5;
+    const mtnMask = smooth01((fbm2(this.nMtn, x * 0.0014 + 800, z * 0.0014, 3) - 0.28) / 0.34);
+    const mtnH = (fbm2(this.nMtnH, x * 0.007, z * 0.007, 4) * 0.5 + 0.5);
+    let h = 34 + cont + hill + mtnMask * mtnH * 44;
+    return clamp(Math.round(h), 4, WH - 8);
+  }
+
+  biomeAt(x, z) {
+    const h = this.heightAt(x, z);
+    if (h < SEA - 2) return BIOME.OCEAN;
+    if (h <= SEA + 1) return BIOME.BEACH;
+    const mtnMask = smooth01((fbm2(this.nMtn, x * 0.0014 + 800, z * 0.0014, 3) - 0.28) / 0.34);
+    if (mtnMask > 0.45 && h > 52) return BIOME.MOUNTAIN;
+    const t = fbm2(this.nTemp, x * 0.0011 + 200, z * 0.0011, 3);
+    if (t < -0.4) return BIOME.SNOW;
+    if (t > 0.52 && h < 52) return BIOME.DESERT;
+    const mo = fbm2(this.nMoist, x * 0.0019 + 300, z * 0.0019, 3);
+    if (mo > 0.12) return BIOME.FOREST;
+    return BIOME.PLAINS;
+  }
+
+  // ---------- 区块访问 ----------
+  getChunk(cx, cz) { return this.chunks.get(this.key(cx, cz)); }
+
+  getBlock(x, y, z) {
+    if (y < 0 || y >= WH) return B.AIR;
+    const cx = x >> 4, cz = z >> 4;
+    const c = this.chunks.get(this.key(cx, cz));
+    if (!c) return B.AIR;
+    return c.data[idx(x & 15, y, z & 15)];
+  }
+
+  getLight(x, y, z) {
+    if (y < 0) return 0;
+    if (y >= WH) return 15;
+    const cx = x >> 4, cz = z >> 4;
+    const c = this.chunks.get(this.key(cx, cz));
+    if (!c) return 15;
+    return c.light[idx(x & 15, y, z & 15)];
+  }
+
+  setBlock(x, y, z, id, record = true) {
+    if (y < 0 || y >= WH) return;
+    const cx = x >> 4, cz = z >> 4;
+    const c = this.chunks.get(this.key(cx, cz));
+    if (!c) return;
+    const lx = x & 15, lz = z & 15;
+    c.data[idx(lx, y, lz)] = id;
+    this.recalcLightColumn(c, lx, lz);
+    if (record) this.edits.set(x + ',' + y + ',' + z, id);
+    this.markDirty(cx, cz);
+    if (lx === 0) this.markDirty(cx - 1, cz);
+    if (lx === 15) this.markDirty(cx + 1, cz);
+    if (lz === 0) this.markDirty(cx, cz - 1);
+    if (lz === 15) this.markDirty(cx, cz + 1);
+  }
+
+  markDirty(cx, cz) {
+    if (this.chunks.has(this.key(cx, cz))) this.dirtyQueue.add(this.key(cx, cz));
+  }
+
+  // 列式天光：向下传播，树叶衰减3/格，水衰减1/格，实心遮断
+  recalcLightColumn(c, lx, lz) {
+    let lv = 15;
+    for (let y = WH - 1; y >= 0; y--) {
+      const id = c.data[idx(lx, y, lz)];
+      const info = blockInfo(id);
+      if (info.opaque) lv = 0;
+      else if (id === B.LEAVES || id === B.BIRCH_LEAVES || id === B.SPRUCE_LEAVES) lv = Math.max(0, lv - 3);
+      else if (id === B.WATER) lv = Math.max(0, lv - 1);
+      c.light[idx(lx, y, lz)] = lv;
+    }
+  }
+
+  recalcAllLight(c) {
+    for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) this.recalcLightColumn(c, x, z);
+  }
+
+  // ---------- 生成 ----------
+  generateChunk(cx, cz) {
+    const data = new Uint8Array(CH * CH * WH);
+    const seed = this.seed;
+    const hcache = new Int16Array(256);
+
+    for (let lz = 0; lz < 16; lz++) {
+      for (let lx = 0; lx < 16; lx++) {
+        const wx = cx * 16 + lx, wz = cz * 16 + lz;
+        const h = this.heightAt(wx, wz);
+        hcache[lx + lz * 16] = h;
+        const biome = this.biomeAt(wx, wz);
+        const col = idx(lx, 0, lz);
+
+        for (let y = 0; y <= h; y++) {
+          let id = B.STONE;
+          if (y <= 1 + ((hash2(wx * 31 + y, wz, seed) * 2) | 0)) id = B.BEDROCK;
+          else if (y === h) {
+            if (biome === BIOME.DESERT || biome === BIOME.BEACH) id = B.SAND;
+            else if (biome === BIOME.OCEAN) id = hash2(wx, wz, seed + 5) < 0.5 ? B.SAND : B.GRAVEL;
+            else if (biome === BIOME.SNOW) id = B.SNOW_GRASS;
+            else if (biome === BIOME.MOUNTAIN) id = h > 70 ? B.SNOW : (h > 60 ? B.STONE : B.GRASS);
+            else id = B.GRASS;
+          } else if (y >= h - 3) {
+            if (biome === BIOME.DESERT || biome === BIOME.BEACH) id = y >= h - 2 ? B.SAND : B.SANDSTONE;
+            else if (biome === BIOME.OCEAN) id = B.SAND;
+            else if (biome === BIOME.MOUNTAIN && h > 60) id = B.STONE;
+            else id = B.DIRT;
+          }
+
+          // 洞穴（避免海底和表层洞穿水）
+          if (id !== B.BEDROCK && y > 3 && y < h - 2 && h > SEA + 1) {
+            const cv = fbm3(this.nCave, wx * 0.052, y * 0.075, wz * 0.052, 2);
+            if (cv > 0.54) { data[col + (y << 8)] = B.AIR; continue; }
+          }
+          // 矿脉
+          if (id === B.STONE) {
+            if (y < 16 && fbm3(this.nOreB, wx * 0.13, y * 0.13, wz * 0.13, 2) > 0.72) id = B.DIAMOND;
+            else if (y < 28 && fbm3(this.nOreB, wx * 0.11 + 90, y * 0.11, wz * 0.11, 2) > 0.72) id = B.GOLD;
+            else if (y < 52 && fbm3(this.nOreA, wx * 0.1, y * 0.1, wz * 0.1, 2) > 0.66) id = B.IRON;
+            else if (y < 72 && fbm3(this.nOreA, wx * 0.09 + 400, y * 0.09, wz * 0.09, 2) > 0.6) id = B.COAL;
+          }
+          data[col + (y << 8)] = id;
+        }
+        // 水
+        for (let y = h + 1; y <= SEA; y++) data[col + (y << 8)] = B.WATER;
+
+        // 植被
+        if (h > SEA + 1 && h < WH - 4) {
+          const top = data[col + (h << 8)];
+          const r = hash2(wx * 7, wz * 13, seed + 99);
+          if (top === B.GRASS) {
+            if (r < 0.10) data[col + ((h + 1) << 8)] = B.TALLGRASS;
+            else if (r < 0.113) data[col + ((h + 1) << 8)] = hash2(wx, wz, seed + 55) < 0.5 ? B.DANDELION : B.POPPY;
+          } else if (top === B.SAND && biome === BIOME.DESERT && r < 0.012) {
+            const ch2 = 1 + ((hash2(wx, wz, seed + 66) * 3) | 0);
+            for (let cy = 1; cy <= ch2 && h + cy < WH - 1; cy++) data[col + ((h + cy) << 8)] = B.CACTUS;
+          } else if (top === B.SNOW_GRASS && r < 0.03) {
+            // 雪原少量云杉由树系统处理
+          }
+        }
+      }
+    }
+
+    // 树（3x3 邻域的确定性树列表，写入落入本区块的部分）
+    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+      const trees = this.treeList(cx + dx, cz + dz);
+      for (const t of trees) this.writeTree(data, cx, cz, t);
+    }
+
+    // 玩家改动回放
+    if (this.edits.size) {
+      for (const [k, id] of this.edits) {
+        const [x, y, z] = k.split(',').map(Number);
+        if ((x >> 4) === cx && (z >> 4) === cz) data[idx(x & 15, y, z & 15)] = id;
+      }
+    }
+
+    const chunk = { cx, cz, data, light: new Uint8Array(CH * CH * WH), dirty: true, meshes: null };
+    this.recalcAllLight(chunk);
+    this.chunks.set(this.key(cx, cz), chunk);
+    // 邻区块边界需要重建网格
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) this.markDirty(cx + dx, cz + dz);
+    return chunk;
+  }
+
+  // 确定性树列表（世界坐标）
+  treeList(cx, cz) {
+    const rnd = mulberry32((hash2(cx, cz, this.seed + 1234) * 4294967296) | 0);
+    const out = [];
+    const wx0 = cx * 16, wz0 = cz * 16;
+    // 用区块中心的生物群系决定密度
+    const biome = this.biomeAt(wx0 + 8, wz0 + 8);
+    let count = 0, type = 'oak';
+    if (biome === BIOME.FOREST) { count = 5 + ((rnd() * 4) | 0); type = 'oak'; }
+    else if (biome === BIOME.PLAINS) count = rnd() < 0.5 ? 1 : 0;
+    else if (biome === BIOME.SNOW) { count = 2 + ((rnd() * 3) | 0); type = 'spruce'; }
+    else if (biome === BIOME.DESERT) count = rnd() < 0.3 ? 1 : 0;
+    else return out;
+    if (biome === BIOME.FOREST && rnd() < 0.25) type = 'birch';
+    for (let i = 0; i < count; i++) {
+      const x = wx0 + ((rnd() * 16) | 0), z = wz0 + ((rnd() * 16) | 0);
+      const h = this.heightAt(x, z);
+      if (h <= SEA + 1 || h > WH - 12) continue;
+      out.push({ x, y: h + 1, z, type, r: rnd() });
+    }
+    return out;
+  }
+
+  // 把树写入区块 data（只写本区块范围；不覆盖已有实体方块）
+  writeTree(data, cx, cz, t) {
+    const put = (wx, wy, wz, id, force = false) => {
+      const lx = wx - cx * 16, lz = wz - cz * 16;
+      if (lx < 0 || lx > 15 || lz < 0 || lz > 15 || wy < 0 || wy >= WH) return;
+      const i = idx(lx, wy, lz);
+      if (force || data[i] === B.AIR || blockInfo(data[i]).cross) data[i] = id;
+    };
+    if (t.type === 'cactus') {
+      const h = 1 + ((t.r * 3) | 0);
+      for (let i = 0; i < h; i++) put(t.x, t.y + i, t.z, B.CACTUS);
+      return;
+    }
+    const logId = t.type === 'spruce' ? B.SPRUCE_LOG : t.type === 'birch' ? B.BIRCH_LOG : B.LOG;
+    const leafId = t.type === 'spruce' ? B.SPRUCE_LEAVES : t.type === 'birch' ? B.BIRCH_LEAVES : B.LEAVES;
+    if (t.type === 'spruce') {
+      const trunk = 6 + ((t.r * 3) | 0);
+      for (let i = 0; i < trunk; i++) put(t.x, t.y + i, t.z, logId, true);
+      let radius = 2;
+      for (let ly = t.y + 2; ly < t.y + trunk; ly += 1) {
+        const tier = (t.y + trunk - ly) % 2;
+        const r = tier === 0 ? radius : Math.max(1, radius - 1);
+        for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
+          if (Math.abs(dx) === r && Math.abs(dz) === r && r > 1) continue;
+          if (dx === 0 && dz === 0) continue;
+          put(t.x + dx, ly, t.z + dz, leafId);
+        }
+        if ((t.y + trunk - ly) % 4 === 3) radius = Math.min(2, radius + 1);
+      }
+      put(t.x, t.y + trunk, t.z, leafId);
+      put(t.x + 1, t.y + trunk - 1, t.z, leafId); put(t.x - 1, t.y + trunk - 1, t.z, leafId);
+      put(t.x, t.y + trunk - 1, t.z + 1, leafId); put(t.x, t.y + trunk - 1, t.z - 1, leafId);
+    } else {
+      const trunk = (t.type === 'birch' ? 5 : 4) + ((t.r * 2.5) | 0);
+      for (let i = 0; i < trunk; i++) put(t.x, t.y + i, t.z, logId, true);
+      const topY = t.y + trunk;
+      for (let dy = -2; dy <= -1; dy++) {
+        for (let dx = -2; dx <= 2; dx++) for (let dz = -2; dz <= 2; dz++) {
+          if (dx === 0 && dz === 0 && dy < 0) continue;
+          if (Math.abs(dx) === 2 && Math.abs(dz) === 2 && hash2(t.x + dx, (t.z + dz) * 7 + dy, 3) < 0.55) continue;
+          put(t.x + dx, topY + dy, t.z + dz, leafId);
+        }
+      }
+      for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
+        if (Math.abs(dx) === 1 && Math.abs(dz) === 1) continue;
+        put(t.x + dx, topY, t.z + dz, leafId);
+      }
+      put(t.x, topY + 1, t.z, leafId);
+    }
+  }
+
+  // 找出生点：从给定坐标螺旋向外找非水陆地
+  findSpawn() {
+    for (let r = 0; r < 64; r++) {
+      for (let a = 0; a < 8; a++) {
+        const x = Math.round(Math.cos(a * Math.PI / 4) * r * 8);
+        const z = Math.round(Math.sin(a * Math.PI / 4) * r * 8);
+        const h = this.heightAt(x, z);
+        if (h > SEA + 1 && h < WH - 10) return { x: x + 0.5, y: h + 2, z: z + 0.5 };
+      }
+    }
+    return { x: 0.5, y: 60, z: 0.5 };
+  }
+}
+
+function smooth01(t) {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  return t * t * (3 - 2 * t);
+}

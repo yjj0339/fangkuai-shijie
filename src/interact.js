@@ -1,0 +1,345 @@
+// ===== 交互：射线、挖掘/放置、TNT、粒子 =====
+import * as THREE from 'three';
+import { B, blockInfo, isSolid } from './blocks.js';
+import { boxCollides } from './physics.js';
+import { createCrackTextures } from './textures.js';
+
+// Amanatides & Woo 体素 DDA
+export function raycastBlocks(world, ox, oy, oz, dx, dy, dz, maxDist) {
+  let x = Math.floor(ox), y = Math.floor(oy), z = Math.floor(oz);
+  const stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1, stepZ = dz > 0 ? 1 : -1;
+  const tDX = Math.abs(1 / (dx || 1e-9)), tDY = Math.abs(1 / (dy || 1e-9)), tDZ = Math.abs(1 / (dz || 1e-9));
+  let tX = (dx > 0 ? (x + 1 - ox) : (ox - x)) * tDX;
+  let tY = (dy > 0 ? (y + 1 - oy) : (oy - y)) * tDY;
+  let tZ = (dz > 0 ? (z + 1 - oz) : (oz - z)) * tDZ;
+  let face = [0, 0, 0];
+  let t = 0;
+  for (let i = 0; i < 256; i++) {
+    const id = world.getBlock(x, y, z);
+    if (id !== B.AIR && id !== B.WATER) {
+      return { x, y, z, id, face, dist: t };
+    }
+    if (tX < tY && tX < tZ) { x += stepX; t = tX; tX += tDX; face = [-stepX, 0, 0]; }
+    else if (tY < tZ) { y += stepY; t = tY; tY += tDY; face = [0, -stepY, 0]; }
+    else { z += stepZ; t = tZ; tZ += tDZ; face = [0, 0, -stepZ]; }
+    if (t > maxDist) return null;
+  }
+  return null;
+}
+
+// tile 平均色（粒子用，带缓存）
+const avgColorCache = new Map();
+export function tileAvgColor(atlas, tileName) {
+  let c = avgColorCache.get(tileName);
+  if (c) return c;
+  const idx = atlas.tileIndex[tileName];
+  const ctx = atlas.canvas.getContext('2d');
+  const d = ctx.getImageData((idx % atlas.cols) * 16, ((idx / atlas.cols) | 0) * 16, 16, 16).data;
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] < 128) continue;
+    r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
+  }
+  n = n || 1;
+  c = [r / n / 255, g / n / 255, b / n / 255];
+  avgColorCache.set(tileName, c);
+  return c;
+}
+
+// ===== 破坏粒子（InstancedMesh 池）=====
+class Particles {
+  constructor(scene, atlas) {
+    const geo = new THREE.BoxGeometry(0.09, 0.09, 0.09);
+    const mat = new THREE.MeshBasicMaterial({ vertexColors: true });
+    this.uDay = { value: 1 };
+    mat.onBeforeCompile = (sh) => {
+      sh.uniforms.uDay = this.uDay;
+      sh.fragmentShader = 'uniform float uDay;\n' + sh.fragmentShader.replace(
+        '#include <color_fragment>', 'diffuseColor.rgb *= vColor * uDay;');
+    };
+    mat.customProgramCacheKey = () => 'particle';
+    this.mesh = new THREE.InstancedMesh(geo, mat, 400);
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(400 * 3), 3);
+    this.mesh.frustumCulled = false;
+    this.mesh.count = 400;
+    scene.add(this.mesh);
+    this.items = new Array(400).fill(null).map(() => ({ life: 0, pos: new THREE.Vector3(), vel: new THREE.Vector3() }));
+    this.dummy = new THREE.Object3D();
+    this.cursor = 0;
+  }
+
+  setDay(v) { this.uDay.value = v; }
+
+  burst(x, y, z, color, n = 14, power = 3) {
+    for (let i = 0; i < n; i++) {
+      const p = this.items[this.cursor];
+      const ci = this.cursor;
+      this.cursor = (this.cursor + 1) % 400;
+      p.life = 0.5 + Math.random() * 0.6;
+      p.pos.set(x + (Math.random() - 0.5) * 0.8, y + (Math.random() - 0.5) * 0.8, z + (Math.random() - 0.5) * 0.8);
+      p.vel.set((Math.random() - 0.5) * power, Math.random() * power * 0.9 + 1, (Math.random() - 0.5) * power);
+      const sh = 0.75 + Math.random() * 0.5;
+      this.mesh.instanceColor.setXYZ(ci, color[0] * sh, color[1] * sh, color[2] * sh);
+    }
+    this.mesh.instanceColor.needsUpdate = true;
+  }
+
+  update(dt, world) {
+    let any = false;
+    for (let i = 0; i < 400; i++) {
+      const p = this.items[i];
+      if (p.life <= 0) { this.dummy.position.set(0, -999, 0); this.dummy.updateMatrix(); this.mesh.setMatrixAt(i, this.dummy.matrix); continue; }
+      any = true;
+      p.life -= dt;
+      p.vel.y -= 20 * dt;
+      const nx = p.pos.x + p.vel.x * dt, ny = p.pos.y + p.vel.y * dt, nz = p.pos.z + p.vel.z * dt;
+      if (isSolid(world.getBlock(Math.floor(nx), Math.floor(p.pos.y), Math.floor(p.pos.z)))) { p.vel.x = 0; } else p.pos.x = nx;
+      if (isSolid(world.getBlock(Math.floor(p.pos.x), Math.floor(ny), Math.floor(p.pos.z)))) { p.vel.y = 0; p.vel.x *= 0.7; p.vel.z *= 0.7; } else p.pos.y = ny;
+      if (isSolid(world.getBlock(Math.floor(p.pos.x), Math.floor(p.pos.y), Math.floor(nz)))) { p.vel.z = 0; } else p.pos.z = nz;
+      this.dummy.position.copy(p.pos);
+      const s = Math.min(1, p.life * 3);
+      this.dummy.scale.setScalar(s);
+      this.dummy.rotation.set(p.life * 5, p.life * 7, 0);
+      this.dummy.updateMatrix();
+      this.mesh.setMatrixAt(i, this.dummy.matrix);
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+    return any;
+  }
+}
+
+// ===== 交互管理器 =====
+export class Interact {
+  constructor(game) {
+    this.game = game;
+    this.cracks = createCrackTextures();
+    const hl = new THREE.BoxGeometry(1.002, 1.002, 1.002);
+    this.highlight = new THREE.LineSegments(
+      new THREE.EdgesGeometry(hl),
+      new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.55 })
+    );
+    this.highlight.visible = false;
+    this.highlight.renderOrder = 5;
+    game.scene.add(this.highlight);
+
+    const crackGeo = new THREE.BoxGeometry(1.004, 1.004, 1.004);
+    this.crackMat = new THREE.MeshBasicMaterial({
+      map: this.cracks[0], transparent: true, polygonOffset: true, polygonOffsetFactor: -1,
+      depthWrite: false,
+    });
+    this.crackMesh = new THREE.Mesh(crackGeo, this.crackMat);
+    this.crackMesh.visible = false;
+    this.crackMesh.renderOrder = 4;
+    game.scene.add(this.crackMesh);
+
+    this.particles = new Particles(game.scene, game.atlas);
+    this.mining = null;      // {x,y,z,id, progress, time}
+    this.placeCd = 0; this.breakCd = 0;
+    this.mouseL = false; this.mouseR = false;
+    this.target = null;
+  }
+
+  // 每帧
+  update(dt) {
+    const g = this.game;
+    const p = g.player;
+    this.placeCd = Math.max(0, this.placeCd - dt);
+    this.breakCd = Math.max(0, this.breakCd - dt);
+    const eye = p.eyePos();
+    const dir = p.lookDir();
+    const reach = p.mode === 'creative' ? 5.5 : 4.5;
+    this.target = g.worldReady ? raycastBlocks(g.world, eye.x, eye.y, eye.z, dir.x, dir.y, dir.z, reach) : null;
+
+    if (this.target && !g.uiOpen()) {
+      this.highlight.visible = true;
+      this.highlight.position.set(this.target.x + 0.5, this.target.y + 0.5, this.target.z + 0.5);
+    } else this.highlight.visible = false;
+
+    // 挖掘
+    if (this.mouseL && !g.uiOpen() && !p.dead) {
+      if (this.target) {
+        if (p.mode === 'creative') {
+          if (this.breakCd <= 0) {
+            this.breakCd = 0.22;
+            p.swing();
+            this.breakBlock(this.target.x, this.target.y, this.target.z, false);
+          }
+        } else {
+          const key = this.target.x + ',' + this.target.y + ',' + this.target.z;
+          if (!this.mining || this.mining.key !== key) {
+            this.mining = { key, x: this.target.x, y: this.target.y, z: this.target.z, id: this.target.id, progress: 0 };
+          }
+          p.swing();
+          const info = blockInfo(this.target.id);
+          if (info.hardness === Infinity) {
+            this.mining.progress = 0;
+          } else {
+            this.mining.progress += dt / Math.max(0.05, info.hardness);
+            const wasStep = (this.mining.progress * 4) | 0;
+            if (((this.mining.progress + dt / Math.max(0.05, info.hardness)) * 4) | 0 !== wasStep) {
+              g.sound.play('dig', { mat: info.snd, vol: 0.35 });
+            }
+          }
+          if (this.mining.progress >= 1) {
+            this.breakBlock(this.mining.x, this.mining.y, this.mining.z, true);
+            this.mining = null;
+          }
+        }
+      } else this.mining = null;
+    } else this.mining = null;
+
+    // 裂缝显示
+    if (this.mining && this.mining.progress > 0.02) {
+      this.crackMesh.visible = true;
+      this.crackMesh.position.set(this.mining.x + 0.5, this.mining.y + 0.5, this.mining.z + 0.5);
+      const stage = Math.min(9, (this.mining.progress * 10) | 0);
+      if (this.crackMat.map !== this.cracks[stage]) {
+        this.crackMat.map = this.cracks[stage];
+        this.crackMat.needsUpdate = true;
+      }
+    } else this.crackMesh.visible = false;
+
+    // 持续放置（按住右键）
+    if (this.mouseR && !g.uiOpen() && !p.dead && this.placeCd <= 0 && this.target) {
+      this.placeBlock();
+    }
+
+    this.particles.setDay(g.sky ? g.sky.dayLight : 1);
+    this.particles.update(dt, g.world);
+  }
+
+  breakBlock(x, y, z, drop) {
+    const g = this.game;
+    const id = g.world.getBlock(x, y, z);
+    if (!id) return;
+    const info = blockInfo(id);
+    if (id === B.TNT) { g.entities.primeTNT(x, y, z, 0.2); g.world.setBlock(x, y, z, B.AIR); return; }
+    g.world.setBlock(x, y, z, B.AIR);
+    g.sound.play('break', { mat: info.snd });
+    // 上方的交叉植物随之消失
+    const above = g.world.getBlock(x, y + 1, z);
+    if (blockInfo(above).cross) {
+      g.world.setBlock(x, y + 1, z, B.AIR);
+      if (drop && blockInfo(above).drop) g.entities.spawnDrop(blockInfo(above).drop, x + 0.5, y + 1.3, z + 0.5);
+    }
+    // 粒子
+    const tile = info.tiles.side || info.tiles.all;
+    this.particles.burst(x + 0.5, y + 0.5, z + 0.5, tileAvgColor(g.atlas, tile), 16, 2.6);
+    if (drop && info.drop) g.entities.spawnDrop(info.drop, x + 0.5, y + 0.4, z + 0.5);
+  }
+
+  placeBlock() {
+    const g = this.game;
+    const p = g.player;
+    const t = this.target;
+    if (!t) return;
+    // 持有物品交互
+    const held = p.heldItem();
+    // TNT 右键点燃
+    if (t.id === B.TNT) {
+      this.placeCd = 0.3;
+      g.entities.primeTNT(t.x, t.y, t.z, 2.0);
+      g.world.setBlock(t.x, t.y, t.z, B.AIR);
+      p.swing();
+      g.sound.play('fuse');
+      return;
+    }
+    if (!held) return;
+    const info = blockInfo(held.id);
+    // 食物
+    if (held.id === B.PORK || held.id === B.STEAK) {
+      if (p.hp < 20 && p.mode === 'survival') {
+        this.placeCd = 0.9;
+        p.hp = Math.min(20, p.hp + 7);
+        p.consumeHeld();
+        g.sound.play('eat');
+        g.ui.refreshVitals();
+        g.ui.toast('美味！恢复 3.5 心');
+      }
+      return;
+    }
+    // 放置
+    const px = t.x + t.face[0], py = t.y + t.face[1], pz = t.z + t.face[2];
+    if (py < 0 || py >= 96) return;
+    const cur = g.world.getBlock(px, py, pz);
+    if (cur !== B.AIR && cur !== B.WATER && !blockInfo(cur).cross) return;
+    if (info.solid) {
+      // 不能放进自己或动物体内
+      if (px + 1 > p.pos.x - p.w && px < p.pos.x + p.w &&
+        py + 1 > p.pos.y && py < p.pos.y + p.h &&
+        pz + 1 > p.pos.z - p.w && pz < p.pos.z + p.w) return;
+      for (const e of g.entities.list) {
+        if (e.kind === 'drop' || e.dead) continue;
+        if (px + 1 > e.pos.x - e.w && px < e.pos.x + e.w &&
+          py + 1 > e.pos.y && py < e.pos.y + e.h &&
+          pz + 1 > e.pos.z - e.w && pz < e.pos.z + e.w) return;
+      }
+    }
+    // 交叉植物只能放在草/泥土上
+    if (info.cross) {
+      const below = g.world.getBlock(px, py - 1, pz);
+      if (below !== B.GRASS && below !== B.DIRT && below !== B.SNOW_GRASS) return;
+    }
+    this.placeCd = 0.21;
+    g.world.setBlock(px, py, pz, held.id);
+    g.sound.play('place', { mat: info.snd });
+    p.swing();
+    if (p.mode === 'survival') p.consumeHeld();
+  }
+
+  pickBlock() {
+    const g = this.game;
+    if (!this.target) return;
+    const id = this.target.id;
+    const p = g.player;
+    for (let i = 0; i < 9; i++) if (p.hotbar[i] && p.hotbar[i].id === id) { p.selected = i; g.ui.refreshHotbar(); return; }
+    if (p.mode === 'creative') {
+      p.hotbar[p.selected] = { id, count: 64 };
+      g.ui.refreshHotbar();
+    }
+  }
+
+  explode(x, y, z, power = 4) {
+    const g = this.game;
+    const r = power + 1;
+    const sound = g.sound;
+    sound.play('explode');
+    for (let dy = -r; dy <= r; dy++) for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) {
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d > r * (0.82 + Math.random() * 0.28)) continue;
+      const bx = Math.round(x + dx), by = Math.round(y + dy), bz = Math.round(z + dz);
+      const id = g.world.getBlock(bx, by, bz);
+      if (!id || id === B.BEDROCK || id === B.WATER) continue;
+      if (id === B.TNT) {
+        g.world.setBlock(bx, by, bz, B.AIR);
+        g.entities.primeTNT(bx, by, bz, 0.3 + Math.random() * 0.7);
+        continue;
+      }
+      g.world.setBlock(bx, by, bz, B.AIR);
+      if (Math.random() < 0.25) {
+        const info = blockInfo(id);
+        if (info.drop) g.entities.spawnDrop(info.drop, bx + 0.5, by + 0.5, bz + 0.5);
+      }
+    }
+    // 粒子与冲击
+    this.particles.burst(x, y + 0.5, z, [0.35, 0.32, 0.3], 90, 11);
+    this.particles.burst(x, y + 0.5, z, [1, 0.75, 0.25], 50, 8);
+    // 实体伤害
+    for (const e of g.entities.list) {
+      if (e.dead) continue;
+      const d = Math.hypot(e.pos.x - x, e.pos.y + e.h / 2 - y, e.pos.z - z);
+      if (d < r * 1.6) {
+        const dmg = Math.round((1 - d / (r * 1.6)) * 22);
+        if (e.kind === 'player') { g.player.damageCd = 0; g.player.damage(dmg, '爆炸'); }
+        else e.hurt(dmg, null);
+        const kd = Math.max(0.1, d);
+        e.vel.x += (e.pos.x - x) / kd * 12 * (1 - d / (r * 1.6));
+        e.vel.y += 6 * (1 - d / (r * 1.6));
+        e.vel.z += (e.pos.z - z) / kd * 12 * (1 - d / (r * 1.6));
+      }
+    }
+    // 相机震动
+    g.shake = Math.max(g.shake, 0.5);
+  }
+}
