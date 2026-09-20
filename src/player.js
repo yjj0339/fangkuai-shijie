@@ -1,5 +1,5 @@
 // ===== 玩家：输入、移动、生存数值、背包、手持渲染 =====
-import * as THREE from 'three';
+import * as THREE from '../vendor/three.module.js';
 import { stepEntity, onGroundCheck, hasSupport, checkWater } from './physics.js';
 import { B, blockInfo } from './blocks.js';
 import { tileUVh, tileUVv } from './textures.js';
@@ -110,10 +110,10 @@ export class Player {
     if (!k.has('KeyW')) this.sprint = false;
     const len = Math.hypot(mx, mz);
     if (len > 0) { mx /= len; mz /= len; }
-    // 旋转到世界坐标（yaw: 0 = -z）
+    // 旋转到世界坐标（yaw: 0 = 朝 -z；前向 = (-sin, -cos)，右向 = (cos, -sin)）
     const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
-    const wx = mx * cos - mz * sin;
-    const wz = mx * sin + mz * cos;
+    const wx = mx * cos + mz * sin;
+    const wz = -mx * sin + mz * cos;
 
     let speed = this.sneak ? SNEAK : this.sprint ? SPRINT : WALK;
     if (this.flying) speed = this.sprint ? FLY_SPRINT : FLY;
