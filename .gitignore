@@ -3,3 +3,4 @@ shots/
 server.log
 *.log
 .zcode/
+.mimosa/
