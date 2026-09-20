@@ -1,5 +1,5 @@
 // ===== 游戏主控：渲染、区块调度、输入、流程 =====
-import * as THREE from 'three';
+import * as THREE from '../vendor/three.module.js';
 import { World, BIOME_NAMES, WH } from './world.js';
 import { createAtlas, makeBlockIcon, createSkins, createSkyTextures } from './textures.js';
 import { createChunkMaterials, buildChunkMeshes, disposeChunkMeshes } from './mesher.js';
@@ -70,6 +70,7 @@ class Game {
 
   // ---------- 开始 ----------
   startGame(mode, fromSave = false) {
+    if (this.state === 'loading') return; // 防止连点重复初始化
     this.sound.resume();
     const save = fromSave ? Save.load() : null;
     const seed = save ? save.seed : (Math.random() * 0x7fffffff) | 0;
@@ -319,6 +320,22 @@ class Game {
   // ---------- 主循环 ----------
   loop(t) {
     requestAnimationFrame((tt) => this.loop(tt));
+    try {
+      this.tick(t);
+    } catch (e) {
+      console.error(e);
+      if (!this._errCount) this._errCount = 0;
+      if (++this._errCount === 3) {
+        const el = $('boot-error');
+        if (el) {
+          el.style.display = 'block';
+          el.textContent = '游戏运行出错：' + (e.message || e) + '，请刷新重试。';
+        }
+      }
+    }
+  }
+
+  tick(t) {
     let dt = Math.min((t - this.lastT) / 1000, 0.05);
     this.lastT = t;
     this.fpsAcc += dt; this.fpsN++;
@@ -332,6 +349,7 @@ class Game {
       if (done >= this.loadTotal) {
         this.state = 'playing';
         $('loading').style.display = 'none';
+        $('boot-error').style.display = 'none';
         // 站稳：从天而降检测改为从高处向下找第一个实心方块
         const p = this.player;
         const bx = Math.floor(p.pos.x), bz = Math.floor(p.pos.z);
@@ -405,5 +423,22 @@ class Game {
 
 // 启动
 window.addEventListener('DOMContentLoaded', () => {
-  window.game = new Game();
+  try {
+    window.game = new Game();
+    window.__gameBooted = true;
+    window.addEventListener('error', () => {
+      const el = document.getElementById('boot-error');
+      if (el && window.game.state === 'loading') {
+        el.style.display = 'block';
+        el.textContent = '世界生成遇到问题，请刷新重试。';
+      }
+    });
+  } catch (e) {
+    const el = document.getElementById('boot-error');
+    if (el) {
+      el.style.display = 'block';
+      el.textContent = '初始化失败：' + e.message;
+    }
+    console.error(e);
+  }
 });
