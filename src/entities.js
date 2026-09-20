@@ -1,5 +1,5 @@
 // ===== 实体：掉落物 / 动物 / 僵尸 / TNT / 生成管理 =====
-import * as THREE from 'three';
+import * as THREE from '../vendor/three.module.js';
 import { B, blockInfo } from './blocks.js';
 import { stepEntity, onGroundCheck } from './physics.js';
 import { mulberry32 } from './math.js';
