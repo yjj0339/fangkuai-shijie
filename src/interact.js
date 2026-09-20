@@ -1,5 +1,5 @@
 // ===== 交互：射线、挖掘/放置、TNT、粒子 =====
-import * as THREE from 'three';
+import * as THREE from '../vendor/three.module.js';
 import { B, blockInfo, isSolid } from './blocks.js';
 import { boxCollides } from './physics.js';
 import { createCrackTextures } from './textures.js';
