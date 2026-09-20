@@ -1,5 +1,5 @@
 // ===== 天空：穹顶渐变、日月、星星、云、雾、昼夜循环 =====
-import * as THREE from 'three';
+import * as THREE from '../vendor/three.module.js';
 import { clamp, lerp } from './math.js';
 
 const DAY_LENGTH = 600; // 全天 10 分钟
