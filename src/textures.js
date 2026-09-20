@@ -1,6 +1,6 @@
 // ===== 程序化像素纹理：图集 / 裂缝 / 图标 / 皮肤 / 日月云 =====
 // 全部 16x16 逐像素绘制，确定性随机保证每次生成一致
-import * as THREE from 'three';
+import * as THREE from '../vendor/three.module.js';
 import { mulberry32 } from './math.js';
 import { BLOCKS, B } from './blocks.js';
 
