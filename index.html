@@ -274,9 +274,29 @@
   <!-- 聊天 -->
   <div id="chat-bar"><input id="chat-input" placeholder="输入消息或 / 命令…（回车发送，Esc 取消）"></div>
 
-  <script type="importmap">
-  { "imports": { "three": "./vendor/three.module.js" } }
+  <div id="boot-error" style="position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:200;display:none;max-width:90vw;background:rgba(120,0,0,.92);color:#fff;padding:10px 16px;border-radius:6px;font-size:13px;text-align:center;"></div>
+
+  <script>
+    // 启动兜底：任何脚本错误显示出来；长时间停留在标题屏提示环境问题
+    window.addEventListener('error', function (e) {
+      var el = document.getElementById('boot-error');
+      if (el && window.__gameBooted !== true) {
+        el.style.display = 'block';
+        el.textContent = '启动出现问题：' + (e.message || '未知错误') + '。请尝试更换 Chrome/Edge/Safari 浏览器或更新系统。';
+      }
+    });
+    setTimeout(function () {
+      var el = document.getElementById('boot-error');
+      if (!el) return;
+      if (window.__gameBooted !== true) {
+        el.style.display = 'block';
+        el.textContent = '加载失败或浏览器版本过旧（本游戏需要支持 ES Module 的现代浏览器，微信内请点右上角「在浏览器打开」）。';
+      } else if (window.game && window.game.state === 'loading') {
+        el.style.display = 'block';
+        el.textContent = '世界仍在生成中（手机较慢，请耐心等待几秒）……';
+      }
+    }, 12000);
   </script>
-  <script type="module" src="./src/main.js"></script>
+  <script type="module" src="./src/main.js?v=20260921"></script>
 </body>
 </html>
