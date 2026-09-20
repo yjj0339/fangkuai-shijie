@@ -1,5 +1,5 @@
 // ===== 区块网格化：面剔除 + 方向光照 + 平滑AO + 天光烘焙 =====
-import * as THREE from 'three';
+import * as THREE from '../vendor/three.module.js';
 import { B, blockInfo, isOpaque } from './blocks.js';
 import { tileUVh, tileUVv } from './textures.js';
 import { CH, WH, SEA } from './world.js';
